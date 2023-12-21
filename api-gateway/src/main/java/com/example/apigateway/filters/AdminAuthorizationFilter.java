@@ -1,0 +1,129 @@
+
+package com.example.apigateway.filters;
+
+import com.example.apigateway.logoutToken.JwtService;
+import com.example.apigateway.logoutToken.Token;
+import com.example.apigateway.logoutToken.TokenRepository;
+import io.jsonwebtoken.MalformedJwtException;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.cloud.gateway.filter.GatewayFilter;
+import org.springframework.cloud.gateway.filter.factory.AbstractGatewayFilterFactory;
+import org.springframework.core.env.Environment;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.http.server.reactive.ServerHttpResponse;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.server.ResponseStatusException;
+import org.springframework.web.server.ServerWebExchange;
+import reactor.core.publisher.Mono;
+
+import java.util.Objects;
+
+@Component
+@Transactional
+public class AdminAuthorizationFilter extends AbstractGatewayFilterFactory<AdminAuthorizationFilter.Config> {
+
+	@Autowired
+	Environment env;
+	@Autowired
+	JwtService jwtService;
+	@Autowired
+	TokenRepository tokenRepository;
+
+	public AdminAuthorizationFilter() {
+		super(Config.class);
+	}
+
+	public static class Config {
+		// Put configuration properties here
+	}
+
+	@Override
+	public GatewayFilter apply(Config config) {
+
+		return (exchange, chain) -> {
+
+			//Get request
+			ServerHttpRequest request = exchange.getRequest();
+
+			//Checks if there is a jwt token in the authorization header
+			if (request.getHeaders().get(HttpHeaders.AUTHORIZATION) == null){
+				return onError(exchange,"Make sure to put a Jwt token in your request",HttpStatus.FORBIDDEN);
+			}
+
+			//Extract auth header from request;
+			String authorizationHeader = Objects.requireNonNull(request.getHeaders().get(HttpHeaders.AUTHORIZATION)).get(0);
+
+			//Extract the jwt from the auth header
+			String jwt = authorizationHeader.replace("Bearer ", "");
+
+
+			try{
+				//Checks if the jwt token has been expired
+				if (jwtService.isTokenExpired(jwt)){
+					return onError(exchange,"Token expired",HttpStatus.FORBIDDEN);
+				}
+
+				//Checks if token is revoked
+				if (tokenRepository.findByToken(jwt).isPresent() && tokenRepository.findByToken(jwt).get().isRevoked()){
+					return onError(exchange,"Token is invalid",HttpStatus.FORBIDDEN);
+				}
+
+				//If this token is a new token, revoke all tokens except this one
+				if (tokenRepository.findByToken(jwt).isEmpty() && !tokenRepository.findAll().isEmpty()){
+					tokenRepository.revokeAndExpireAllTokensBySubject(jwtService.extractUsername(jwt));
+				}
+
+			}catch (MalformedJwtException e){
+				return onError(exchange,"Token bad formatted",HttpStatus.FORBIDDEN);
+			}
+
+			//Extract revoked from the jwt
+			boolean revoked = (boolean) jwtService.extractAllClaims(jwt).get("revoked");
+
+			//Extract expired from the jwt
+			boolean expired = jwtService.isTokenExpired(jwt);
+
+			//Creates this token object to register the new token to the database
+			Token token = Token.builder()
+					.token(jwt)
+					.subject(jwtService.extractUsername(jwt))
+					.revoked(revoked)
+					.expired(expired)
+					.build();
+
+			//Checks if the token already exists in the database if not, then save it
+			if (tokenRepository.findByToken(jwt).isEmpty()){
+				tokenRepository.save(token);
+			}
+
+			//Checks if user is and admin
+			if (!jwtService.extractAllClaims(jwt).get("authority").equals("[ADMIN]")){
+				return onError(exchange,"Only users with ADMIN role can access this endpoint",HttpStatus.FORBIDDEN);
+			}
+
+			return chain.filter(exchange);
+		};
+
+	}
+
+	//Exception handler
+	private Mono<Void> onError(ServerWebExchange exchange, String err, HttpStatus httpStatus) {
+		ServerHttpResponse response = exchange.getResponse();
+		response.setStatusCode(httpStatus);
+		response.getHeaders().add(HttpHeaders.CONTENT_TYPE, "application/json");
+
+		return response.writeWith(Mono.just(response.bufferFactory().wrap(err.getBytes())))
+				.doOnError(error -> {
+					throw new ResponseStatusException(httpStatus, err);
+				});
+	}
+
+
+
+
+
+
+}
